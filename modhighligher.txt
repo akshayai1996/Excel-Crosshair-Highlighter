@@ -1,436 +1,252 @@
-
 Option Explicit
-' ========= Crosshair Highlighter ï¿½ FINAL (Viewport-aware + Cached Scope + No StatusBar) =========
-' Logic preserved: OnKey navigation, one visible macro Crosshair_Run, CF row/col.
-' Perf: cached ResolveScope per sheet; AppliesTo auto-refreshes on viewport change; no ws.Calculate;
-'       StatusBar disabled entirely; Debug.Print disabled.
-' Formatting: fill #F8F8D0 (RGB 248,248,208); row borders Top+Bottom; column borders Left+Right; gray color.
+' =========================================================
+' Shape-Based Crosshair – ZERO LAG (FINAL)
+' Excel 2010 - 2024 - M365
+'
+' FEATURES:
+' - Shape overlay (no CF, no repaint lag)
+' - Arrow-key driven
+' - Auto-sync on scroll (OnTime watcher)
+' - Edge-aware scrolling (native Excel feel)
+' - Clean ON/OFF toggle
+'
+' ALT+F8:
+'   Only ONE macro visible:
+'   CrosshairShape_Toggle
+' =========================================================
 
-Private Const APP_NAME As String = "CrosshairHighlighter"
-Private Const REG_SECTION As String = "Settings"
-Private Const DEF_ENABLED As Long = 1
-Private Const DEF_MODE As String = "Both"
-Private Const DEF_HEADER_ROWS As Long = 1
-Private Const DEF_HEADER_COLS As Long = 0
-Private Const DEF_SCOPE As String = "UsedRange"
-Private Const MAX_ROWS As Long = 5000
-Private Const MAX_COLS As Long = 200
+' ---------- Shape names ----------
+Private Const ROW_SHAPE As String = "XH_Row"
+Private Const COL_SHAPE As String = "XH_Col"
 
-Private gHooked As Boolean
-Private gLastSheetName As String
-Private gLastRow As Long
-Private gLastCol As Long
-Private gLastViewTL As String
-Private gLastViewBR As String
+' ---------- Runtime state ----------
+Private gEnabled As Boolean
+Private gLastViewAddr As String
+Private gScrollWatcherActive As Boolean
 
-' Cached scope per sheet
-Private Type ScopeCacheEntry
-    SheetName As String
-    FirstCell As String
-    LastCell As String
-End Type
-Private gScopeSheet As String
-Private gScopeFirst As String
-Private gScopeLast As String
+' =========================================================
+' ? ONLY PUBLIC MACRO
+' =========================================================
 
-' ================= PUBLIC =================
-Public Sub Crosshair_Run()
-    On Error GoTo FailSoft
-    If GetEnabled() = 1 Then
-        SaveSetting APP_NAME, REG_SECTION, "Enabled", "0"
-        CleanupOnExit
-        MsgBox "Crosshair: OFF", vbInformation
+Public Sub CrosshairShape_Toggle()
+    If gEnabled Then
+        StopCrosshair
+        MsgBox "Crosshair OFF", vbInformation
     Else
-        SaveSetting APP_NAME, REG_SECTION, "Enabled", "1"
-        gLastSheetName = vbNullString: gLastRow = 0: gLastCol = 0
-        gLastViewTL = vbNullString: gLastViewBR = vbNullString
-        ClearScopeCache
-        If TypeOf ActiveSheet Is Worksheet Then
-            ApplyToSheet ActiveSheet
-            If Not ActiveCell Is Nothing Then RecalcSheet ActiveSheet
-        End If
-        HookKeys
-        MsgBox "Crosshair: ON", vbInformation
+        StartCrosshair
+        MsgBox "Crosshair ON", vbInformation
     End If
-    Exit Sub
-FailSoft:
-    LogError "Crosshair_Run"
-    MsgBox "Crosshair: Error while toggling." & vbCrLf & Err.Description, vbExclamation
 End Sub
 
-Public Sub Crosshair_RefreshHidden()
-    If GetEnabled() = 0 Then Exit Sub
-    If TypeOf ActiveSheet Is Worksheet Then UpdateForActiveSelection ActiveSheet
+' =========================================================
+' START / STOP
+' =========================================================
+
+Private Sub StartCrosshair()
+    gEnabled = True
+    HookArrowKeys
+    UpdateCrosshair
+    StartScrollWatcher
 End Sub
 
-' ================= KEYS =================
-Private Sub HookKeys()
-    On Error Resume Next
-    Application.OnKey "{UP}", "Crosshair_Key_Up"
-    Application.OnKey "{DOWN}", "Crosshair_Key_Down"
-    Application.OnKey "{LEFT}", "Crosshair_Key_Left"
-    Application.OnKey "{RIGHT}", "Crosshair_Key_Right"
-    Application.OnKey "{TAB}", "Crosshair_Key_Tab"
-    Application.OnKey "+{TAB}", "Crosshair_Key_ShiftTab"
-    Application.OnKey "~", "Crosshair_Key_Enter"
-    Application.OnKey "{ENTER}", "Crosshair_Key_Enter"
-    Application.OnKey "{PGUP}", "Crosshair_Key_PgUp"
-    Application.OnKey "{PGDN}", "Crosshair_Key_PgDn"
-    Application.OnKey "^{PGUP}", "Crosshair_Key_CtrlPgUp"
-    Application.OnKey "^{PGDN}", "Crosshair_Key_CtrlPgDn"
-    Application.OnKey "{HOME}", "Crosshair_Key_Home"
-    Application.OnKey "^{HOME}", "Crosshair_Key_CtrlHome"
-    Application.OnKey "^{LEFT}", "Crosshair_Key_CtrlLeft"
-    Application.OnKey "^{RIGHT}", "Crosshair_Key_CtrlRight"
-    Application.OnKey "^{UP}", "Crosshair_Key_CtrlUp"
-    Application.OnKey "^{DOWN}", "Crosshair_Key_CtrlDown"
-    gHooked = True
-End Sub
-Private Sub UnhookKeys()
-    On Error Resume Next
-    Dim keys As Variant, k As Variant
-    keys = Array("{UP}", "{DOWN}", "{LEFT}", "{RIGHT}", "{TAB}", "+{TAB}", "~", "{ENTER}", "{PGUP}", "{PGDN}", "^{PGUP}", "^{PGDN}", "{HOME}", "^{HOME}", "^{LEFT}", "^{RIGHT}", "^{UP}", "^{DOWN}")
-    For Each k In keys: Application.OnKey CStr(k): Next k
-    gHooked = False
+Private Sub StopCrosshair()
+    gEnabled = False
+    UnhookArrowKeys
+    StopScrollWatcher
+    DeleteShapes ActiveSheet
 End Sub
 
-Public Sub Crosshair_Key_Up():        NavAndRefreshDirect "UP":        End Sub
-Public Sub Crosshair_Key_Down():      NavAndRefreshDirect "DOWN":      End Sub
-Public Sub Crosshair_Key_Left():      NavAndRefreshDirect "LEFT":      End Sub
-Public Sub Crosshair_Key_Right():     NavAndRefreshDirect "RIGHT":     End Sub
-Public Sub Crosshair_Key_Tab():       NavAndRefreshDirect "TAB":       End Sub
-Public Sub Crosshair_Key_ShiftTab():  NavAndRefreshDirect "SHIFTTAB":  End Sub
-Public Sub Crosshair_Key_Enter():     NavAndRefreshDirect "ENTER":     End Sub
-Public Sub Crosshair_Key_PgUp():      NavAndRefreshDirect "PGUP":      End Sub
-Public Sub Crosshair_Key_PgDn():      NavAndRefreshDirect "PGDN":      End Sub
-Public Sub Crosshair_Key_CtrlPgUp():  NavAndRefreshDirect "CTRLPGUP":  End Sub
-Public Sub Crosshair_Key_CtrlPgDn():  NavAndRefreshDirect "CTRLPGDN":  End Sub
-Public Sub Crosshair_Key_Home():      NavAndRefreshDirect "HOME":      End Sub
-Public Sub Crosshair_Key_CtrlHome():  NavAndRefreshDirect "CTRLHOME":  End Sub
-Public Sub Crosshair_Key_CtrlLeft():  NavAndRefreshDirect "CTRLLEFT":  End Sub
-Public Sub Crosshair_Key_CtrlRight(): NavAndRefreshDirect "CTRLRIGHT": End Sub
-Public Sub Crosshair_Key_CtrlUp():    NavAndRefreshDirect "CTRLUP":    End Sub
-Public Sub Crosshair_Key_CtrlDown():  NavAndRefreshDirect "CTRLDOWN":  End Sub
+' =========================================================
+' KEY HOOKING (Excel 2010 SAFE)
+' =========================================================
 
-Private Sub NavAndRefreshDirect(ByVal direction As String)
-    Dim errNum As Long, errDesc As String
-    On Error GoTo Done
-    If GetEnabled() = 0 Then GoTo Done
-    If Not TypeOf ActiveSheet Is Worksheet Then GoTo Done
-    If ActiveCell Is Nothing Then GoTo Done
-    Dim ws As Worksheet, tgt As Range
+Private Sub HookArrowKeys()
+    Application.OnKey "{UP}", "XH_Key_Up"
+    Application.OnKey "{DOWN}", "XH_Key_Down"
+    Application.OnKey "{LEFT}", "XH_Key_Left"
+    Application.OnKey "{RIGHT}", "XH_Key_Right"
+End Sub
+
+Private Sub UnhookArrowKeys()
+    Application.OnKey "{UP}"
+    Application.OnKey "{DOWN}"
+    Application.OnKey "{LEFT}"
+    Application.OnKey "{RIGHT}"
+End Sub
+
+Private Sub XH_Key_Up():    MoveAndUpdate -1, 0: End Sub
+Private Sub XH_Key_Down():  MoveAndUpdate 1, 0: End Sub
+Private Sub XH_Key_Left():  MoveAndUpdate 0, -1: End Sub
+Private Sub XH_Key_Right(): MoveAndUpdate 0, 1: End Sub
+
+' =========================================================
+' NAVIGATION
+' =========================================================
+
+Private Sub MoveAndUpdate(dRow As Long, dCol As Long)
+    If Not gEnabled Then Exit Sub
+    If ActiveCell Is Nothing Then Exit Sub
+    If Not TypeOf ActiveSheet Is Worksheet Then Exit Sub
+
+    Dim ws As Worksheet
     Set ws = ActiveSheet
-    Set tgt = ActiveCell
-    Select Case UCase$(direction)
-        Case "UP":    If tgt.Row > 1 Then Set tgt = tgt.Offset(-1, 0)
-        Case "DOWN":  If tgt.Row < ws.Rows.Count Then Set tgt = tgt.Offset(1, 0)
-        Case "LEFT":  If tgt.Column > 1 Then Set tgt = tgt.Offset(0, -1)
-        Case "RIGHT": If tgt.Column < ws.Columns.Count Then Set tgt = tgt.Offset(0, 1)
-        Case "TAB"
-            If tgt.Column < ws.Columns.Count Then
-                Set tgt = tgt.Offset(0, 1)
-            ElseIf tgt.Row < ws.Rows.Count Then
-                Set tgt = ws.Cells(tgt.Row + 1, 1)
-            End If
-        Case "SHIFTTAB": If tgt.Column > 1 Then Set tgt = tgt.Offset(0, -1)
-        Case "ENTER":    If tgt.Row < ws.Rows.Count Then Set tgt = tgt.Offset(1, 0)
-        Case "PGDN":     Set tgt = PageMove(ws, tgt, 1)
-        Case "PGUP":     Set tgt = PageMove(ws, tgt, -1)
-        Case "CTRLPGUP": ActivateAdjacentSheet -1: If TypeOf ActiveSheet Is Worksheet Then UpdateForActiveSelection ActiveSheet: GoTo Done
-        Case "CTRLPGDN": ActivateAdjacentSheet 1:  If TypeOf ActiveSheet Is Worksheet Then UpdateForActiveSelection ActiveSheet: GoTo Done
-        Case "HOME":     Set tgt = ws.Cells(tgt.Row, 1)
-        Case "CTRLHOME": Set tgt = ws.Cells(1, 1)
-        Case "CTRLLEFT":  Set tgt = tgt.End(xlToLeft)
-        Case "CTRLRIGHT": Set tgt = tgt.End(xlToRight)
-        Case "CTRLUP":    Set tgt = tgt.End(xlUp)
-        Case "CTRLDOWN":  Set tgt = tgt.End(xlDown)
-        Case Else: GoTo Done
-    End Select
-    tgt.Select
-    UpdateForActiveSelection ws
-Done:
-    errNum = Err.Number: errDesc = Err.Description
-    On Error Resume Next
-   
-If errNum <> 0 Then ' (debug disabled)
-    ' Optional: LogError "Nav(" & direction & ")"  ' uncomment if needed
-End If
-End Sub
 
+    Dim r As Long, c As Long
+    r = ActiveCell.Row + dRow
+    c = ActiveCell.Column + dCol
 
-Private Function PageMove(ByVal ws As Worksheet, ByVal startCell As Range, ByVal dir As Long) As Range
-    On Error Resume Next
-    Dim stride As Long: stride = GetPageStride(): If stride < 1 Then stride = 20
-    Dim r As Long: r = startCell.Row + (dir * stride)
-    If r < 1 Then r = 1
-    If r > ws.Rows.Count Then r = ws.Rows.Count
-    Set PageMove = ws.Cells(r, startCell.Column)
-End Function
+    If r < 1 Or c < 1 Then Exit Sub
+    If r > ws.Rows.Count Or c > ws.Columns.Count Then Exit Sub
 
-Private Function GetPageStride() As Long
-    On Error Resume Next
-    Dim visRows As Long: visRows = ActiveWindow.VisibleRange.Rows.Count
-    If visRows > 1 Then GetPageStride = visRows - 1 Else GetPageStride = 20
-End Function
-
-Private Sub ActivateAdjacentSheet(ByVal delta As Long)
-    On Error GoTo Fail
-    Dim wb As Workbook: Set wb = ActiveWorkbook
-    If wb Is Nothing Then Exit Sub
-    Dim i As Long, idx As Long
-    For i = 1 To wb.Worksheets.Count
-        If wb.Worksheets(i).Name = ActiveSheet.Name Then idx = i: Exit For
-    Next i
-    Dim j As Long: j = idx
-    Do
-        j = j + delta
-        If j < 1 Or j > wb.Worksheets.Count Then Exit Do
-        If wb.Worksheets(j).Visible = xlSheetVisible Then wb.Worksheets(j).Activate: Exit Do
-    Loop
-    Exit Sub
-Fail:
-    LogError "ActivateAdjacentSheet"
-End Sub
-
-' ================= UPDATE LOGIC =================
-Private Sub UpdateForActiveSelection(ByVal ws As Worksheet)
-    On Error GoTo CleanExit
-    If ws Is Nothing Then GoTo CleanExit
-    Dim curSheet As String, curRow As Long, curCol As Long
-    curSheet = ws.Name
-    If Not ActiveCell Is Nothing And ActiveCell.Parent Is ws Then
-        curRow = ActiveCell.Row: curCol = ActiveCell.Column
-    Else
-        GoTo CleanExit
-    End If
-
-    ' Detect viewport change
-    Dim tl As String, br As String
-    tl = AddressTL(ActiveWindow.VisibleRange)
-    br = AddressBR(ActiveWindow.VisibleRange)
-
-    If (curSheet <> gLastSheetName) Then
-        ApplyToSheet ws
-    End If
-
-    If (curSheet <> gLastSheetName) Or (curRow <> gLastRow) Or (curCol <> gLastCol) Or (tl <> gLastViewTL) Or (br <> gLastViewBR) Then
-        If (tl <> gLastViewTL) Or (br <> gLastViewBR) Then RefreshAppliesTo ws
-        RecalcSheet ws
-        gLastSheetName = curSheet: gLastRow = curRow: gLastCol = curCol
-        gLastViewTL = tl: gLastViewBR = br
-        ' StatusBar disabled entirely for performance
-    End If
-    Exit Sub
-CleanExit:
-End Sub
-
-' ================= CF APPLY / REFRESH =================
-Private Sub ApplyToSheet(ByVal ws As Worksheet)
-    If ws Is Nothing Then Exit Sub
-    If ws.ProtectContents Then Exit Sub
-    Dim prevScreen As Boolean, prevEvents As Boolean
-    SaveAppState prevScreen, prevEvents
-    On Error GoTo CleanFail
-    EnsureNames ws
-    ClearCF ws
-    Dim rng As Range: Set rng = GetCachedScope(ws)
-    Dim vr As Range: Set vr = ActiveWindow.VisibleRange
-    If Not vr Is Nothing Then Set rng = Application.Intersect(rng, vr)
-    Dim hdrRows As Long: hdrRows = GetHeaderRows()
-    Dim hdrCols As Long: hdrCols = GetHeaderCols()
-    Dim mode As String: mode = UCase$(GetMode())
-    Dim rowFormula As String, colFormula As String
-    rowFormula = "=AND(ROW()=Crosshair_RowIdx,ROW()>" & CStr(hdrRows) & ",COLUMN()>" & CStr(hdrCols) & ")"
-    colFormula = "=AND(COLUMN()=Crosshair_ColIdx,ROW()>" & CStr(hdrRows) & ",COLUMN()>" & CStr(hdrCols) & ")"
-    If mode = "ROW" Or mode = "BOTH" Then
-        Dim fc1 As FormatCondition
-        Set fc1 = rng.FormatConditions.Add(Type:=xlExpression, Formula1:=rowFormula)
-        fc1.StopIfTrue = False
-        fc1.Interior.Color = RGB(248, 248, 208)
-        ApplyBorderSet fc1, True, False
-    End If
-    If mode = "COLUMN" Or mode = "BOTH" Then
-        Dim fc2 As FormatCondition
-        Set fc2 = rng.FormatConditions.Add(Type:=xlExpression, Formula1:=colFormula)
-        fc2.StopIfTrue = False
-        fc2.Interior.Color = RGB(248, 248, 208)
-        ApplyBorderSet fc2, False, True
-    End If
-    RecalcSheet ws
-CleanExit:
-    RestoreAppState prevScreen, prevEvents
-    Exit Sub
-CleanFail:
-    LogError "ApplyToSheet": Resume CleanExit
-End Sub
-
-Private Sub RefreshAppliesTo(ByVal ws As Worksheet)
-    On Error Resume Next
-    If ws Is Nothing Then Exit Sub
-    Dim vr As Range: Set vr = ActiveWindow.VisibleRange
-    If vr Is Nothing Then Exit Sub
-    Dim rng As Range: Set rng = GetCachedScope(ws)
-    Dim newApplies As Range: Set newApplies = Application.Intersect(rng, vr)
-    If newApplies Is Nothing Then Exit Sub
-    Dim i As Long
-    For i = ws.Cells.FormatConditions.Count To 1 Step -1
-        With ws.Cells.FormatConditions(i)
-            If .Type = xlExpression Then
-                Dim f As String: f = .Formula1
-                If InStr(1, f, "Crosshair_RowIdx", vbTextCompare) > 0 Or InStr(1, f, "Crosshair_ColIdx", vbTextCompare) > 0 Then
-                    .ModifyAppliesToRange newApplies
-                End If
-            End If
-        End With
-    Next i
-End Sub
-
-Private Sub RecalcSheet(ByVal ws As Worksheet)
-    If GetEnabled() = 0 Then Exit Sub
-    If ws Is Nothing Or ws.ProtectContents Then Exit Sub
-    If ActiveCell Is Nothing Or Not ActiveCell.Parent Is ws Then Exit Sub
-    SetNameConst ws, "Crosshair_RowIdx", ActiveCell.Row
-    SetNameConst ws, "Crosshair_ColIdx", ActiveCell.Column
-End Sub
-
-Private Sub ClearCF(ByVal ws As Worksheet)
-    Dim rng As Range: Set rng = GetCachedScope(ws)
-    On Error Resume Next
-    Dim i As Long
-    For i = rng.FormatConditions.Count To 1 Step -1
-        With rng.FormatConditions(i)
-            If .Type = xlExpression Then
-                Dim f As String: f = .Formula1
-                If InStr(1, f, "Crosshair_RowIdx", vbTextCompare) > 0 Or InStr(1, f, "Crosshair_ColIdx", vbTextCompare) > 0 Then
-                    rng.FormatConditions(i).Delete
-                End If
-            End If
-        End With
-    Next i
-End Sub
-
-Private Sub ApplyBorderSet(ByVal fc As FormatCondition, ByVal isRow As Boolean, ByVal isColumn As Boolean)
-    On Error Resume Next
-    fc.Borders(xlEdgeTop).LineStyle = xlLineStyleNone
-    fc.Borders(xlEdgeBottom).LineStyle = xlLineStyleNone
-    fc.Borders(xlEdgeLeft).LineStyle = xlLineStyleNone
-    fc.Borders(xlEdgeRight).LineStyle = xlLineStyleNone
-    Dim bColor As Long: bColor = RGB(128, 128, 128)
-    If isRow Then
-        With fc.Borders(xlEdgeTop)
-            .LineStyle = xlContinuous: .Weight = xlThin: .Color = bColor
-        End With
-        With fc.Borders(xlEdgeBottom)
-            .LineStyle = xlContinuous: .Weight = xlThin: .Color = bColor
-        End With
-    End If
-    If isColumn Then
-        With fc.Borders(xlEdgeLeft)
-            .LineStyle = xlContinuous: .Weight = xlThin: .Color = bColor
-        End With
-        With fc.Borders(xlEdgeRight)
-            .LineStyle = xlContinuous: .Weight = xlThin: .Color = bColor
-        End With
-    End If
-End Sub
-
-' ================= HELPERS =================
-Private Sub EnsureNames(ByVal ws As Worksheet)
-    On Error Resume Next
-    Dim n As Name
-    Set n = ws.Names("Crosshair_RowIdx"): If n Is Nothing Then ws.Names.Add Name:="Crosshair_RowIdx", RefersTo:="=1"
-    Set n = ws.Names("Crosshair_ColIdx"): If n Is Nothing Then ws.Names.Add Name:="Crosshair_ColIdx", RefersTo:="=1"
-End Sub
-
-Private Sub SetNameConst(ByVal ws As Worksheet, ByVal nm As String, ByVal val As Long)
-    On Error Resume Next
-    Dim n As Name: Set n = ws.Names(nm)
-    If Not n Is Nothing Then n.RefersTo = "=" & CStr(val) Else ws.Names.Add Name:=nm, RefersTo:="=" & CStr(val)
-End Sub
-
-Private Function GetCachedScope(ByVal ws As Worksheet) As Range
-    ' Return cached scope if valid; else compute and cache it.
-    If gScopeSheet = ws.Name And Len(gScopeFirst) > 0 And Len(gScopeLast) > 0 Then
-        Set GetCachedScope = ws.Range(gScopeFirst, gScopeLast)
-        Exit Function
-    End If
-    Dim s As String: s = GetScope()
-    Dim r As Range
-    If UCase$(s) Like "USED*" Or s = "UsedRange" Then
-        On Error Resume Next
-        Set r = ws.UsedRange
-        On Error GoTo 0
-        If r Is Nothing Then Set r = ws.Range("A1")
-    Else
-        Dim lastRow As Long, lastCol As Long
-        lastRow = Application.WorksheetFunction.Min(ws.Rows.Count, MAX_ROWS)
-        lastCol = Application.WorksheetFunction.Min(ws.Columns.Count, MAX_COLS)
-        Set r = ws.Range(ws.Cells(1, 1), ws.Cells(lastRow, lastCol))
-    End If
-    gScopeSheet = ws.Name
-    gScopeFirst = r.Cells(1, 1).Address(False, False)
-    gScopeLast = r.Cells(r.Rows.Count, r.Columns.Count).Address(False, False)
-    Set GetCachedScope = r
-End Function
-
-Private Sub ClearScopeCache()
-    gScopeSheet = vbNullString
-    gScopeFirst = vbNullString
-    gScopeLast = vbNullString
-End Sub
-
-Private Function GetEnabled() As Long
-    On Error Resume Next
-    Dim v As Long: v = CLng(GetSetting(APP_NAME, REG_SECTION, "Enabled", CStr(DEF_ENABLED)))
-    If v <> 0 Then v = 1: GetEnabled = v
-End Function
-Private Function GetMode() As String
-    Dim s As String: s = GetSetting(APP_NAME, REG_SECTION, "Mode", DEF_MODE)
-    Select Case UCase$(s)
-        Case "ROW", "COLUMN", "BOTH": GetMode = s
-        Case Else: GetMode = DEF_MODE
-    End Select
-End Function
-Private Function GetHeaderRows() As Long
-    On Error Resume Next
-    Dim v As Long: v = CLng(GetSetting(APP_NAME, REG_SECTION, "HeaderRows", CStr(DEF_HEADER_ROWS)))
-    If v < 0 Then v = 0: GetHeaderRows = v Else GetHeaderRows = v
-End Function
-Private Function GetHeaderCols() As Long
-    On Error Resume Next
-    Dim v As Long: v = CLng(GetSetting(APP_NAME, REG_SECTION, "HeaderCols", CStr(DEF_HEADER_COLS)))
-    If v < 0 Then v = 0: GetHeaderCols = v Else GetHeaderCols = v
-End Function
-Private Function GetScope() As String
-    Dim s As String: s = GetSetting(APP_NAME, REG_SECTION, "Scope", DEF_SCOPE)
-    If UCase$(s) Like "USED*" Then GetScope = "UsedRange" Else GetScope = "FullSheet"
-End Function
-
-Private Function AddressTL(ByVal rng As Range) As String
-    On Error Resume Next
-    If rng Is Nothing Then AddressTL = vbNullString Else AddressTL = rng.Cells(1, 1).Address(False, False)
-End Function
-Private Function AddressBR(ByVal rng As Range) As String
-    On Error Resume Next
-    If rng Is Nothing Then AddressBR = vbNullString Else AddressBR = rng.Cells(rng.Rows.Count, rng.Columns.Count).Address(False, False)
-End Function
-
-Private Sub CleanupOnExit()
-    On Error Resume Next
-    UnhookKeys
-    If TypeOf ActiveSheet Is Worksheet Then ClearCF ActiveSheet
-End Sub
-Private Sub SaveAppState(ByRef prevScreen As Boolean, ByRef prevEvents As Boolean)
-    prevScreen = Application.ScreenUpdating
-    prevEvents = Application.EnableEvents
     Application.ScreenUpdating = False
-    Application.EnableEvents = False
+    ws.Cells(r, c).Select
+    EnsureCellVisible ActiveCell
+    UpdateCrosshair
+    Application.ScreenUpdating = True
 End Sub
-Private Sub RestoreAppState(ByVal prevScreen As Boolean, ByVal prevEvents As Boolean)
-    Application.EnableEvents = prevEvents
-    Application.ScreenUpdating = prevScreen
+
+' =========================================================
+' EDGE-AWARE SCROLL (NATIVE FEEL)
+' =========================================================
+
+Private Sub EnsureCellVisible(c As Range)
+
+    Dim vr As Range
+    Set vr = ActiveWindow.VisibleRange
+
+    ' ---- tweak for scroll feel ----
+   Const ROW_MARGIN As Long = 10   ' scroll buffer (rows)
+   Const COL_MARGIN As Long = 10   ' scroll buffer (columns)
+
+    Dim topRow As Long, bottomRow As Long
+    Dim leftCol As Long, rightCol As Long
+
+    topRow = vr.Row + ROW_MARGIN
+    bottomRow = vr.Row + vr.Rows.Count - 1 - ROW_MARGIN
+
+    leftCol = vr.Column + COL_MARGIN
+    rightCol = vr.Column + vr.Columns.Count - 1 - COL_MARGIN
+
+    With ActiveWindow
+        ' ----- vertical -----
+        If c.Row < topRow Then
+            .ScrollRow = Application.Max(1, c.Row - ROW_MARGIN)
+        ElseIf c.Row > bottomRow Then
+            .ScrollRow = c.Row - vr.Rows.Count + 1 + ROW_MARGIN
+        End If
+
+        ' ----- horizontal -----
+        If c.Column < leftCol Then
+            .ScrollColumn = Application.Max(1, c.Column - COL_MARGIN)
+        ElseIf c.Column > rightCol Then
+            .ScrollColumn = c.Column - vr.Columns.Count + 1 + COL_MARGIN
+        End If
+    End With
 End Sub
-Private Sub LogError(ByVal context As String)
+
+' =========================================================
+' CROSSHAIR UPDATE
+' =========================================================
+
+Private Sub UpdateCrosshair()
+    If Not gEnabled Then Exit Sub
+    If ActiveCell Is Nothing Then Exit Sub
+    If Not TypeOf ActiveSheet Is Worksheet Then Exit Sub
+
+    Dim vr As Range
     On Error Resume Next
-    Debug.Print Now & " - Crosshair error in " & context & ": (" & Err.Number & ") " & Err.Description
+    Set vr = ActiveWindow.VisibleRange
+    On Error GoTo 0
+    If vr Is Nothing Then Exit Sub
+
+    CreateOrMoveShapes ActiveSheet, ActiveCell, vr
 End Sub
+
+Private Sub CreateOrMoveShapes(ws As Worksheet, c As Range, vr As Range)
+
+    Dim rowShp As Shape, colShp As Shape
+
+    ' ---------- ROW ----------
+    On Error Resume Next
+    Set rowShp = ws.Shapes(ROW_SHAPE)
+    On Error GoTo 0
+
+    If rowShp Is Nothing Then
+        Set rowShp = ws.Shapes.AddShape(msoShapeRectangle, vr.Left, c.Top, vr.Width, c.Height)
+        With rowShp
+            .Name = ROW_SHAPE
+            .Fill.ForeColor.RGB = RGB(248, 248, 208) ' yellow
+            .Fill.Transparency = 0.35
+            .Line.Visible = msoFalse
+            .Placement = xlFreeFloating
+            .ZOrder msoSendToBack
+        End With
+    Else
+        rowShp.Top = c.Top
+        rowShp.Left = vr.Left
+        rowShp.Width = vr.Width
+        rowShp.Height = c.Height
+    End If
+
+    ' ---------- COLUMN ----------
+    On Error Resume Next
+    Set colShp = ws.Shapes(COL_SHAPE)
+    On Error GoTo 0
+
+    If colShp Is Nothing Then
+        Set colShp = ws.Shapes.AddShape(msoShapeRectangle, c.Left, vr.Top, c.Width, vr.Height)
+        With colShp
+            .Name = COL_SHAPE
+            .Fill.ForeColor.RGB = RGB(248, 248, 208) ' yellow
+            .Fill.Transparency = 0.35
+            .Line.Visible = msoFalse
+            .Placement = xlFreeFloating
+            .ZOrder msoSendToBack
+        End With
+    Else
+        colShp.Left = c.Left
+        colShp.Top = vr.Top
+        colShp.Width = c.Width
+        colShp.Height = vr.Height
+    End If
+End Sub
+
+Private Sub DeleteShapes(ws As Worksheet)
+    On Error Resume Next
+    ws.Shapes(ROW_SHAPE).Delete
+    ws.Shapes(COL_SHAPE).Delete
+End Sub
+
+' =========================================================
+' AUTO-SYNC ON SCROLL (TIMER BASED)
+' =========================================================
+
+Private Sub StartScrollWatcher()
+    gLastViewAddr = ""
+    gScrollWatcherActive = True
+    ScrollWatcherTick
+End Sub
+
+Private Sub StopScrollWatcher()
+    gScrollWatcherActive = False
+End Sub
+
+Private Sub ScrollWatcherTick()
+    If Not gScrollWatcherActive Or Not gEnabled Then Exit Sub
+
+    Dim vr As Range
+    On Error Resume Next
+    Set vr = ActiveWindow.VisibleRange
+    On Error GoTo 0
+
+    If Not vr Is Nothing Then
+        If vr.Address <> gLastViewAddr Then
+            gLastViewAddr = vr.Address
+            UpdateCrosshair
+        End If
+    End If
+
+    ' Excel 2010-safe timer
+    Application.OnTime Now + TimeSerial(0, 0, 1), "ScrollWatcherTick"
+End Sub
+
